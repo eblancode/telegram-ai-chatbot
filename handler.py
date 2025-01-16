@@ -1,3 +1,15 @@
+"""
+Core handler module for the Telegram AI chatbot.
+This module contains all the message handlers, callback processors, and bot commands.
+It manages user interactions, GPT model integration, voice responses, and menu navigation.
+Main functionalities include:
+- Command handlers (/start, /help, etc.)
+- Menu callback processors
+- GPT text and image processing
+- Voice message handling
+- User data management
+"""
+
 import asyncio
 import base64
 import configparser
@@ -27,7 +39,7 @@ from buttons import (
 )
 from buttons import keyboard_pic, keyboard
 from function import info_menu_func
-from function import prune_messages, process_voice_message
+from function import prune_messages, process_voice_message, simple_bot_responses
 from middlewares import ThrottlingMiddleware
 from text import start_message, help_message, system_message_text
 
@@ -55,8 +67,12 @@ openai_api_key = config.get("OpenAI", "api_key")
 # Using parameters for initializing OpenAI
 client = OpenAI(api_key=openai_api_key)
 
-# Reading the list of IDs
-OWNER_ID = {int(owner_id) for owner_id in config.get("Telegram", "owner_id").split(",")}
+# Reading the user IDs
+OWNER_ID = int(config.get("Telegram", "owner_id"))
+ADMIN_ID = int(config.get("Telegram", "admin_id"))
+
+# Global variable to control all users access
+ALL_USERS_ACCESS = False
 
 # Initializing the router
 router = Router()
@@ -65,6 +81,68 @@ router.message.middleware(ThrottlingMiddleware(spin=1.5))
 
 last_message_id = {}
 
+# Function to check user access
+async def checkAccess(message: Message) -> bool:
+    """
+    Check if the user has access to the bot.
+    
+    Args:
+        message (Message): The incoming Telegram message
+    
+    Returns:
+        bool: True if the user has access, False otherwise
+    """
+    user_id = message.from_user.id
+    
+    # Always allow
+    if user_id == OWNER_ID or user_id == ADMIN_ID:
+        return True
+    
+    # Check if all users are allowed
+    if ALL_USERS_ACCESS:
+        return True
+    
+    # Deny access with a message
+    await message.answer(
+        f"<i>Sorry, you do not have access to this bot.\n"
+        f"User ID:</i> <b>{user_id}</b>"
+    )
+    return False
+
+# Commands for access control
+@router.message(F.text == "/enable_all")
+async def enable_all_access(message: Message):
+    """
+    Command to enable bot access for all users.
+    Only users in OWNER_ID can use this command.
+    """
+    user_id = message.from_user.id
+    
+    # Ensure who can use this command
+    if user_id != OWNER_ID and user_id != ADMIN_ID:
+        await message.answer("You do not have permission to use this command.")
+        return
+    
+    global ALL_USERS_ACCESS
+    ALL_USERS_ACCESS = True
+    await message.answer("Bot access has been enabled for all users.")
+
+@router.message(F.text == "/disable_all")
+async def disable_all_access(message: Message):
+    """
+    Command to disable bot access for non-owner users.
+    Only users in OWNER_ID can use this command.
+    """
+    user_id = message.from_user.id
+    
+    # Ensure who can use this command
+    if user_id != OWNER_ID and user_id != ADMIN_ID:
+        await message.answer("You do not have permission to use this command.")
+        return
+    
+    global ALL_USERS_ACCESS
+    ALL_USERS_ACCESS = False
+    await message.answer("Bot access has been disabled for all non-owner users. Owner access remains unaffected.")
 
 # Creating a class for the state machine
 class ChangeValueState(StatesGroup):
@@ -74,20 +152,14 @@ class ChangeValueState(StatesGroup):
 @router.message(F.text == "/start")
 @flags.throttling_key("spin")
 async def command_start_handler(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-
-    if user_id not in OWNER_ID:
-        await message.answer(
-            f"<i>Sorry, you do not have access to this bot.\n"
-            f"User ID:</i> <b>{user_id}</b>"
-        )
+    if not await checkAccess(message):
         return
 
     if state is not None:
         await state.clear()
 
     # Retrieving or creating user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(message.from_user.id)
 
     user_data.model = "gpt-4o-mini"
     user_data.model_message_info = "4o mini"
@@ -101,7 +173,7 @@ async def command_start_handler(message: Message, state: FSMContext):
     user_data.pic_size = "1024x1024"
 
     # Saving updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(message.from_user.id)
 
     await message.answer(start_message)
     return
@@ -110,16 +182,13 @@ async def command_start_handler(message: Message, state: FSMContext):
 @router.message(F.text == "/menu")
 @flags.throttling_key("spin")
 async def process_key_button(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-
-    if user_id not in OWNER_ID:
-        await message.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(message):
         return
 
     if state is not None:
         await state.clear()
 
-    info_menu = await info_menu_func(user_id)
+    info_menu = await info_menu_func(message.from_user.id)
     
     await message.answer(text=f"{info_menu}", reply_markup=keyboard)
     return
@@ -129,17 +198,14 @@ async def process_key_button(message: Message, state: FSMContext):
 async def process_callback_model_choice(
         callback_query: CallbackQuery, state: FSMContext
 ):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     if state is not None:
         await state.clear()
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"<i>Model:</i> {user_data.model_message_info} ",
@@ -152,14 +218,11 @@ async def process_callback_model_choice(
 
 @router.callback_query(F.data == "gpt_4o_mini")
 async def process_callback_menu_1(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if user_data.model == "gpt-4o-mini":
         await callback_query.answer()
@@ -171,7 +234,7 @@ async def process_callback_menu_1(callback_query: CallbackQuery):
     user_data.model_message_chat = "4o mini:\n\n"
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"<i>Model:</i> {user_data.model_message_info} ",
@@ -184,14 +247,11 @@ async def process_callback_menu_1(callback_query: CallbackQuery):
 
 @router.callback_query(F.data == "gpt_4_o")
 async def process_callback_menu_2(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if user_data.model == "gpt-4o":
         await callback_query.answer()
@@ -203,7 +263,7 @@ async def process_callback_menu_2(callback_query: CallbackQuery):
     user_data.model_message_chat = "4o:\n\n"
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"<i>Model:</i> {user_data.model_message_info} ",
@@ -216,14 +276,11 @@ async def process_callback_menu_2(callback_query: CallbackQuery):
 
 @router.callback_query(F.data == "gpt_o1_mini")
 async def process_callback_menu_1(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if user_data.model == "o1-mini":
         await callback_query.answer()
@@ -235,7 +292,7 @@ async def process_callback_menu_1(callback_query: CallbackQuery):
     user_data.model_message_chat = "o1 mini:\n\n"
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"<i>Model:</i> {user_data.model_message_info} ",
@@ -248,14 +305,11 @@ async def process_callback_menu_1(callback_query: CallbackQuery):
 
 @router.callback_query(F.data == "gpt_o1_preview")
 async def process_callback_menu_2(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if user_data.model == "o1-preview":
         await callback_query.answer()
@@ -267,7 +321,7 @@ async def process_callback_menu_2(callback_query: CallbackQuery):
     user_data.model_message_chat = "o1:\n\n"
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"<i>Model:</i> {user_data.model_message_info} ",
@@ -280,14 +334,11 @@ async def process_callback_menu_2(callback_query: CallbackQuery):
 
 @router.callback_query(F.data == "dall_e_3")
 async def process_callback_menu_3(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if user_data.model == "dall-e-3":
         await callback_query.answer()
@@ -298,7 +349,7 @@ async def process_callback_menu_3(callback_query: CallbackQuery):
     user_data.model_message_chat = "DALL·E 3:\n\n"
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"<i>Model:</i> {user_data.model_message_info} ",
@@ -313,17 +364,14 @@ async def process_callback_menu_3(callback_query: CallbackQuery):
 async def process_callback_menu_pic_setup(
         callback_query: CallbackQuery, state: FSMContext
 ):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     if state is not None:
         await state.clear()
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"{user_data.pic_grade} : {user_data.pic_size} ",
@@ -336,14 +384,11 @@ async def process_callback_menu_pic_setup(
 
 @router.callback_query(F.data == "set_sd")
 async def process_callback_set_sd(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if user_data.pic_grade == "standard":
         await callback_query.answer()
@@ -352,7 +397,7 @@ async def process_callback_set_sd(callback_query: CallbackQuery):
     user_data.pic_grade = "standard"
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"{user_data.pic_grade} : {user_data.pic_size} ",
@@ -365,14 +410,11 @@ async def process_callback_set_sd(callback_query: CallbackQuery):
 
 @router.callback_query(F.data == "set_hd")
 async def process_callback_set_hd(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if user_data.pic_grade == "hd":
         await callback_query.answer()
@@ -381,7 +423,7 @@ async def process_callback_set_hd(callback_query: CallbackQuery):
     user_data.pic_grade = "hd"
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"{user_data.pic_grade} : {user_data.pic_size} ",
@@ -394,14 +436,11 @@ async def process_callback_set_hd(callback_query: CallbackQuery):
 
 @router.callback_query(F.data == "set_1024x1024")
 async def process_callback_set_1024x1024(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if user_data.pic_size == "1024x1024":
         await callback_query.answer()
@@ -410,7 +449,7 @@ async def process_callback_set_1024x1024(callback_query: CallbackQuery):
     user_data.pic_size = "1024x1024"
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"{user_data.pic_grade} : {user_data.pic_size} ",
@@ -423,14 +462,11 @@ async def process_callback_set_1024x1024(callback_query: CallbackQuery):
 
 @router.callback_query(F.data == "set_1024x1792")
 async def process_callback_set_1024x1792(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if user_data.pic_size == "1024x1792":
         await callback_query.answer()
@@ -439,7 +475,7 @@ async def process_callback_set_1024x1792(callback_query: CallbackQuery):
     user_data.pic_size = "1024x1792"
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"{user_data.pic_grade} : {user_data.pic_size} ",
@@ -452,14 +488,11 @@ async def process_callback_set_1024x1792(callback_query: CallbackQuery):
 
 @router.callback_query(F.data == "set_1792x1024")
 async def process_callback_set_1792x1024(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if user_data.pic_size == "1792x1024":
         await callback_query.answer()
@@ -468,7 +501,7 @@ async def process_callback_set_1792x1024(callback_query: CallbackQuery):
     user_data.pic_size = "1792x1024"
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"{user_data.pic_grade} : {user_data.pic_size} ",
@@ -483,17 +516,14 @@ async def process_callback_set_1792x1024(callback_query: CallbackQuery):
 async def process_callback_context_work(
         callback_query: CallbackQuery, state: FSMContext
 ):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     if state is not None:
         await state.clear()
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"<i>Messages:</i> {user_data.count_messages} ",
@@ -506,13 +536,10 @@ async def process_callback_context_work(
 
 @router.callback_query(F.data == "context")
 async def process_callback_context(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
     history = await generate_history(user_data.messages)
 
     if callback_query.message.text == "Context is empty":
@@ -583,20 +610,17 @@ async def send_menu(user_id):
 
 @router.callback_query(F.data == "clear")
 async def process_callback_clear(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     user_data.messages = []
     user_data.count_messages = 0
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     if callback_query.message.text == "Context cleared":
         await callback_query.answer()
@@ -614,17 +638,14 @@ async def process_callback_clear(callback_query: CallbackQuery):
 async def process_callback_voice_answer_work(
         callback_query: CallbackQuery, state: FSMContext
 ):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     if state is not None:
         await state.clear()
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     info_voice_answer = "on" if user_data.voice_answer else "off"
 
@@ -639,14 +660,11 @@ async def process_callback_voice_answer_work(
 
 @router.callback_query(F.data == "voice_answer_add")
 async def process_callback_voice_answer_add(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if user_data.voice_answer:
         await callback_query.answer()
@@ -655,7 +673,7 @@ async def process_callback_voice_answer_add(callback_query: CallbackQuery):
     user_data.voice_answer = True
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     info_voice_answer = "enabled" if user_data.voice_answer else "off"
 
@@ -669,14 +687,11 @@ async def process_callback_voice_answer_add(callback_query: CallbackQuery):
 
 @router.callback_query(F.data == "voice_answer_del")
 async def process_callback_voice_answer_del(callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if not user_data.voice_answer:
         await callback_query.answer()
@@ -685,7 +700,7 @@ async def process_callback_voice_answer_del(callback_query: CallbackQuery):
     user_data.voice_answer = False
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     info_voice_answer = "on" if user_data.voice_answer else "off"
 
@@ -702,17 +717,14 @@ async def process_callback_voice_answer_del(callback_query: CallbackQuery):
 async def process_callback_voice_answer_work(
         callback_query: CallbackQuery, state: FSMContext
 ):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     if state is not None:
         await state.clear()
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     info_system_message = (
         "Undefined" if not user_data.system_message else user_data.system_message
@@ -732,10 +744,7 @@ async def process_callback_voice_answer_work(
 async def process_callback_change_value(
         callback_query: types.CallbackQuery, state: FSMContext
 ):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     await state.set_state(ChangeValueState.waiting_for_new_value)
@@ -751,17 +760,14 @@ async def process_callback_change_value(
 
 @router.callback_query(F.data == "delete_value")
 async def process_callback_delete_value(callback_query: CallbackQuery, state: FSMContext):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     if state is not None:
         await state.clear()
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     if not user_data.system_message:
         await callback_query.answer()
@@ -770,7 +776,7 @@ async def process_callback_delete_value(callback_query: CallbackQuery, state: FS
     user_data.system_message = ""
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(callback_query.from_user.id)
 
     info_system_message = (
         "Undefined" if not user_data.system_message else user_data.system_message
@@ -788,27 +794,24 @@ async def process_callback_delete_value(callback_query: CallbackQuery, state: FS
 # New value input handler
 @router.message(StateFilter(ChangeValueState.waiting_for_new_value))
 async def process_new_value(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-
-    if user_id not in OWNER_ID:
-        await message.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(message):
         return
 
     global sys_massage
 
     if message.voice:
-        sys_massage = await process_voice_message(bot, message, user_id)
+        sys_massage = await process_voice_message(bot, message, message.from_user.id)
 
     elif message.text:
         sys_massage = message.text
 
     # Your method of obtaining or creating user data
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(message.from_user.id)
 
     user_data.system_message = sys_massage
 
     # Saving the updated data to the database
-    await save_user_data(user_id)
+    await save_user_data(message.from_user.id)
 
     await state.clear()
 
@@ -825,16 +828,13 @@ async def process_new_value(message: types.Message, state: FSMContext):
 
 @router.callback_query(F.data == "back_menu")
 async def process_callback_menu_back(callback_query: CallbackQuery, state: FSMContext):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     if state is not None:
         await state.clear()
 
-    info_menu = await info_menu_func(user_id)
+    info_menu = await info_menu_func(callback_query.from_user.id)
 
     await callback_query.message.edit_text(
         text=f"{info_menu}", reply_markup=keyboard
@@ -844,17 +844,14 @@ async def process_callback_menu_back(callback_query: CallbackQuery, state: FSMCo
 
 @router.callback_query(F.data == "info")
 async def process_callback_info(callback_query: CallbackQuery, state: FSMContext):
-    user_id = callback_query.from_user.id
-
-    if user_id not in OWNER_ID:
-        await callback_query.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(callback_query.message):
         return
 
     if state is not None:
         await state.clear()
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(callback_query.from_user.id)
 
     info_voice_answer = "on" if user_data.voice_answer else "off"
 
@@ -864,7 +861,7 @@ async def process_callback_info(callback_query: CallbackQuery, state: FSMContext
 
     info_messages = (
         f"<i>Date:</i> <b>{formatted_datetime}</b>\n"
-        f"<i>User ID:</i> <b>{user_id}</b>\n"
+        f"<i>User ID:</i> <b>{callback_query.from_user.id}</b>\n"
         f"<i>Model:</i> <b>{user_data.model_message_info}</b>\n"
         f"<i>Image</i>\n"
         f"<i>Quality:</i> <b>{user_data.pic_grade}</b>\n"
@@ -886,17 +883,14 @@ async def process_callback_info(callback_query: CallbackQuery, state: FSMContext
 @router.message(F.text == "/help")
 @flags.throttling_key("spin")
 async def help_handler(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-
-    if user_id not in OWNER_ID:
-        await message.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(message):
         return
 
     if state is not None:
         await state.clear()
 
     # Retrieve or create user data objects
-    await get_or_create_user_data(user_id)
+    await get_or_create_user_data(message.from_user.id)
 
     await message.answer(help_message)
     return
@@ -904,15 +898,11 @@ async def help_handler(message: Message, state: FSMContext):
 
 @router.message(F.content_type.in_({"text", "voice"}))
 async def chatgpt_text_handler(message: Message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    if user_id not in OWNER_ID:
-        await message.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(message):
         return
 
     # Retrieve or create user data objects
-    user_data = await get_or_create_user_data(user_id)
+    user_data = await get_or_create_user_data(message.from_user.id)
 
     user_prompt = ""
 
@@ -921,11 +911,20 @@ async def chatgpt_text_handler(message: Message):
     last_message_id = response.message_id
 
     if message.voice:
-        user_prompt = await process_voice_message(bot, message, user_id)
+        user_prompt = await process_voice_message(bot, message, message.from_user.id)
 
     elif message.text:
         user_prompt = message.text
 
+    # First, check for simple bot responses
+    # from function import simple_bot_responses
+    simple_response = await simple_bot_responses(user_prompt)
+    if simple_response:
+        await message.bot.delete_message(message.chat.id, last_message_id)
+        await message.reply(simple_response)
+        return
+
+    # Rest of the existing code remains the same
     if (
             user_data.model == "gpt-4o-mini"
             or user_data.model == "gpt-4o"
@@ -959,7 +958,7 @@ async def chatgpt_text_handler(message: Message):
             )
 
             # The bot is typing...
-            await message.bot.send_chat_action(chat_id, action="typing")
+            await message.bot.send_chat_action(message.chat.id, action="typing")
 
             # Getting the model's response
             response_message = chat_completion.choices[0].message.content
@@ -973,10 +972,10 @@ async def chatgpt_text_handler(message: Message):
             user_data.count_messages += 1
 
             # Saving the updated data to the database
-            await save_user_data(user_id)
+            await save_user_data(message.from_user.id)
 
             # Deleting the temporary message
-            await message.bot.delete_message(chat_id, last_message_id)
+            await message.bot.delete_message(message.chat.id, last_message_id)
 
             # Function to send kwargs
             async def send_message_kwargs(
@@ -1032,22 +1031,19 @@ async def chatgpt_text_handler(message: Message):
 
                 lines = final_message.split("\n")
                 chunks = []
-                current_chunk = ""
+                current_chunk = []
 
                 for line in lines:
                     # If adding another line would exceed the limit, add the current chunk and start a new one
                     if len(current_chunk) + len(line) + 1 > 4096:  # +1 для \n
-                        chunks.append(current_chunk)
-                        current_chunk = line
+                        chunks.append("\n".join(current_chunk))
+                        current_chunk = [line]
                     else:
-                        if current_chunk:
-                            current_chunk += line + "\n"
-                        else:
-                            current_chunk = line
+                        current_chunk.append(line)
 
                 ## Don't forget to add the last chunk
                 if current_chunk:
-                    chunks.append(current_chunk)
+                    chunks.append("\n".join(current_chunk))
 
                 # Now send all chunks as separate messages
                 for chunk in chunks:
@@ -1154,16 +1150,16 @@ async def chatgpt_text_handler(message: Message):
             return
 
         # The bot is uploading a photo...
-        await message.bot.send_chat_action(chat_id, action="upload_photo")
+        await message.bot.send_chat_action(message.chat.id, action="upload_photo")
 
         # User's message counter
         user_data.count_messages += 1
 
         # Saving the updated data to the database
-        await save_user_data(user_id)
+        await save_user_data(message.from_user.id)
 
         # Deleting the temporary message
-        await message.bot.delete_message(chat_id, last_message_id)
+        await message.bot.delete_message(message.chat.id, last_message_id)
 
         await message.bot.send_photo(
             message.chat.id,
@@ -1175,18 +1171,14 @@ async def chatgpt_text_handler(message: Message):
 
 @router.message(F.photo)
 async def chatgpt_photo_vision_handler(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    if user_id not in OWNER_ID:
-        await message.answer("Sorry, you do not have access to this bot.")
+    if not await checkAccess(message):
         return
 
     if state is not None:
         await state.clear()
 
     try:
-        user_data = await get_or_create_user_data(user_id)
+        user_data = await get_or_create_user_data(message.from_user.id)
         temp_message = await message.answer("⏳ Hold on, your request is being processed!")
 
         text = message.caption or "What's in the picture?"
@@ -1198,8 +1190,8 @@ async def chatgpt_photo_vision_handler(message: types.Message, state: FSMContext
 
         ai_response = await process_image_with_gpt(text, base64_image)
 
-        await update_user_data(user_data, user_id)
-        await message.bot.delete_message(chat_id, temp_message.message_id)
+        await update_user_data(user_data, message.from_user.id)
+        await message.bot.delete_message(message.chat.id, temp_message.message_id)
         await message.answer(ai_response)
 
     except Exception as e:
