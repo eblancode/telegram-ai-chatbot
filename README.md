@@ -2,6 +2,8 @@
 
 This project is a Telegram bot developed in Python utilizing the aiogram library. It integrates seamlessly with the OpenAI API to provide advanced text and image generation capabilities. The bot includes features to process audio messages, offering a versatile interaction experience. It supports multiple OpenAI models, including GPT-4.0 Omni, o1, and DALL·E 3, allowing users to engage through text, voice, and multimedia-based interactions.
 
+![README Markmap](./readme_markmap.png)
+
 ## Installation and Setup
 
 ### Requirements
